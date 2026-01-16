@@ -6,31 +6,66 @@ import os
 # Adapt path to import from src
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
-from src.db.schema import get_engine, Invoice, Payment, ReconciliationResult
+from src.db.schema import get_engine, ReconciliationResult
 from src.core.matcher import reconcile_all, audit_integrity
+from src.integrations.dolibarr import DolibarrClient
 from sqlalchemy.orm import Session
 
 st.set_page_config(page_title="Agentic Reconciliation", layout="wide")
 
-st.title("Agentic Reconciliation Dashboard")
+st.title("Agentic Reconciliation Dashboard (Dolibarr Connected)")
 
 # --- Sidebar Controls ---
 st.sidebar.header("Actions")
 if st.sidebar.button("Run Reconciliation & Audit"):
     with st.spinner("Agent is working..."):
         matches = reconcile_all()
-        issues = audit_integrity()
-    st.sidebar.success(f"Processed! Found {len(matches)} new matches and {len(issues)} issues.")
+        # issues = audit_integrity() # TODO
+    st.sidebar.success(f"Processed! Found {len(matches)} new matches.")
 
 # --- Data Loading ---
 engine = get_engine('data/project.db')
 session = Session(bind=engine)
 
 def load_data():
-    invoices = pd.read_sql(session.query(Invoice).statement, session.bind)
-    payments = pd.read_sql(session.query(Payment).statement, session.bind)
+    client = DolibarrClient()
+    
+    # Fetch Invoices
+    invoices = client.get_unpaid_invoices()
+    if invoices:
+        df_invoices = pd.DataFrame(invoices)
+        # Select relevant cols
+        display_cols = ['ref', 'total_ttc', 'date', 'socid'] 
+        # socid is customer ID. We might want to fetch name, but keeping simple for MVP.
+        # Filter if columns missing
+        available_cols = [c for c in display_cols if c in df_invoices.columns]
+        df_invoices = df_invoices[available_cols]
+    else:
+        df_invoices = pd.DataFrame(columns=['ref', 'total_ttc', 'date'])
+
+    # Fetch Payments
+    accounts = client.get_bank_accounts()
+    all_lines = []
+    for acc in accounts:
+        lines = client.get_bank_lines(acc['id'])
+        if lines:
+            for l in lines:
+                l['account_label'] = acc['label']
+            all_lines.extend(lines)
+            
+    if all_lines:
+        df_payments = pd.DataFrame(all_lines)
+        # display cols: label, amount, datev, num_releve
+        display_cols = ['label', 'amount', 'datev', 'account_label']
+        available_cols = [c for c in display_cols if c in df_payments.columns]
+        df_payments = df_payments[available_cols]
+    else:
+        df_payments = pd.DataFrame(columns=['label', 'amount', 'datev'])
+
+    # Fetch Agent Results (Local)
     results = pd.read_sql(session.query(ReconciliationResult).statement, session.bind)
-    return invoices, payments, results
+    
+    return df_invoices, df_payments, results
 
 df_invoices, df_payments, df_results = load_data()
 
@@ -38,27 +73,17 @@ df_invoices, df_payments, df_results = load_data()
 col1, col2 = st.columns(2)
 
 with col1:
-    st.subheader("🏢 CRM: Invoices")
+    st.subheader("🏢 CRM: Invoices (Dolibarr)")
     st.dataframe(
         df_invoices, 
-        use_container_width=False,
-        column_config={
-            "invoice_number": st.column_config.TextColumn(width="medium"),
-            "customer_name": st.column_config.TextColumn(width="large"),
-            "id": st.column_config.NumberColumn(format="%d", width="small"),
-        }
+        use_container_width=False
     )
 
 with col2:
-    st.subheader("🏦 ERP: Payments")
+    st.subheader("🏦 ERP: Payments (Dolibarr)")
     st.dataframe(
         df_payments, 
-        use_container_width=False,
-        column_config={
-            "description": st.column_config.TextColumn(width="large"),
-            "reference_id": st.column_config.TextColumn(width="medium"),
-            "id": st.column_config.NumberColumn(format="%d", width="small"),
-        }
+        use_container_width=False
     )
 
 st.divider()
@@ -67,21 +92,7 @@ st.divider()
 st.subheader("✅ Reconciliation Results (Agent State)")
 
 if not df_results.empty:
-    # Join with Invoices and Payments for readability
-    # Note: efficient queries would do this in SQL, but for MVP pandas merge is fine
-    res_enhanced = df_results.merge(df_invoices, left_on='invoice_id', right_on='id', suffixes=('_res', '_inv'))
-    res_enhanced = res_enhanced.merge(df_payments, left_on='payment_id', right_on='id', suffixes=('', '_pay'))
-    
-    display_cols = ['invoice_number', 'customer_name', 'amount', 'reference_id', 'confidence_score', 'match_date']
-    st.dataframe(
-        res_enhanced[display_cols], 
-        use_container_width=False,
-        column_config={
-            "customer_name": st.column_config.TextColumn(width="large"),
-            "invoice_number": st.column_config.TextColumn(width="medium"),
-            "reference_id": st.column_config.TextColumn(width="medium"),
-        }
-    )
+    st.dataframe(df_results, use_container_width=False)
 else:
     st.info("No reconciliation results found yet. Click 'Run' in the sidebar.")
 

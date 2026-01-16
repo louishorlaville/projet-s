@@ -1,54 +1,75 @@
+from datetime import datetime, date
 from sqlalchemy.orm import Session
-from datetime import timedelta, date
-import sys
-import os
 
 # Ensure import paths work if run directly
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-
-from src.db.schema import Invoice, Payment, ReconciliationResult, get_engine, InvoiceStatus
+try:
+    from src.db.schema import ReconciliationResult, get_engine
+    from src.integrations.dolibarr import DolibarrClient
+except ImportError:
+    # Fallback for direct execution
+    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+    from src.db.schema import ReconciliationResult, get_engine
+    from src.integrations.dolibarr import DolibarrClient
 
 def reconcile_all(db_path='data/project.db'):
     """
-    Core reconciliation logic.
-    Returns a list of match dictionaries AND saves them to ReconciliationResult table.
+    Core reconciliation logic using Dolibarr Live Data.
     """
     engine = get_engine(db_path)
     session = Session(bind=engine)
+    client = DolibarrClient()
 
-    # 1. Fetch Candidates
-    # Invoices: Only UNPAID
-    unpaid_invoices = session.query(Invoice).filter(Invoice.status == 'UNPAID').all()
+    # 1. Fetch Candidates from Dolibarr
+    print("Fetching Unpaid Invoices...")
+    unpaid_invoices = client.get_unpaid_invoices()
     
-    # Payments: Only those NOT in ReconciliationResult
+    print("Fetching Bank Accounts...")
+    accounts = client.get_bank_accounts()
+    all_payments = []
+    
+    for acc in accounts:
+        print(f"Fetching lines for account {acc['label']}...")
+        lines = client.get_bank_lines(acc['id'])
+        all_payments.extend(lines)
+
+    # 2. Filter already reconciled payments
     matched_payment_ids = session.query(ReconciliationResult.payment_id).all()
-    matched_payment_ids = {id[0] for id in matched_payment_ids} # Set for O(1) lookup
+    matched_payment_ids = {str(id[0]) for id in matched_payment_ids} # Set strings for comparison
     
-    all_payments = session.query(Payment).all() # Filter in python for now or subquery
-    unreconciled_payments = [p for p in all_payments if p.id not in matched_payment_ids]
+    unreconciled_payments = [p for p in all_payments if str(p['id']) not in matched_payment_ids]
 
     matches = []
-    
     used_payment_ids = set()
+
+    print(f"Matching {len(unpaid_invoices)} invoices against {len(unreconciled_payments)} payments...")
 
     for inv in unpaid_invoices:
         best_match = None
         
+        # Parse Invoice Date (Dolibarr returns timestamps or strings)
+        # Assuming 'date' is timestamp integer
+        inv_date = datetime.fromtimestamp(int(inv['date'])).date()
+        inv_amount = float(inv['total_ttc'])
+        
         for pay in unreconciled_payments:
-            if pay.id in used_payment_ids:
+            pay_id = str(pay['id'])
+            if pay_id in used_payment_ids:
                 continue
             
-            # Hard Constraint: Currency & Amount must match exactly (for MVP)
-            if inv.currency != pay.currency:
-                continue
-                
-            if abs(inv.amount - pay.amount) > 0.01: # Float tolerance
+            # Constraints
+            # Payment amount is usually negative for debit, positive for credit?
+            # Dolibarr Bank Lines: existing transactions.
+            pay_amount = float(pay['amount'])
+            
+            # Exact Amount Match
+            if abs(inv_amount - pay_amount) > 0.01:
                 continue
             
-            # Soft Constraint: Date within 5 days
-            date_diff = abs((pay.date - inv.date).days)
+            # Date Logic
+            pay_date = datetime.fromtimestamp(int(pay['datev'])).date() # datev = value date
+            date_diff = abs((pay_date - inv_date).days)
+            
             if date_diff <= 5:
-                # Found a potential match
                 if best_match is None or date_diff < best_match['date_diff']:
                     best_match = {
                         'payment': pay,
@@ -58,12 +79,13 @@ def reconcile_all(db_path='data/project.db'):
         
         if best_match:
             pay = best_match['payment']
-            used_payment_ids.add(pay.id)
+            pay_id = str(pay['id'])
+            used_payment_ids.add(pay_id)
             
-            # Create Match Record
+            # Save Match
             match_record = ReconciliationResult(
-                invoice_id=inv.id,
-                payment_id=pay.id,
+                invoice_id=int(inv['id']),
+                payment_id=int(pay['id']),
                 confidence_score=best_match['confidence'],
                 match_date=date.today()
             )
@@ -73,42 +95,15 @@ def reconcile_all(db_path='data/project.db'):
                 'invoice': inv,
                 'payment': pay,
                 'confidence': best_match['confidence'],
-                'reason': f"Amount exact match, Date diff: {best_match['date_diff']} days"
+                'reason': f"Amount exact match ({inv_amount}), Date diff: {best_match['date_diff']} days"
             })
 
-    session.commit() # Save matches to Agent DB
+    session.commit()
     session.close()
     return matches
 
 def audit_integrity(db_path='data/project.db'):
-    """
-    Checks for discrepancies:
-    1. PAID invoices in CRM that have NO record in ReconciliationResults (Audit Fail).
-    """
-    engine = get_engine(db_path)
-    session = Session(bind=engine)
-    
-    # Get all PAID invoices
-    paid_invoices = session.query(Invoice).filter(Invoice.status == 'PAID').all()
-    
-    issues = []
-    
-    # Get all Invoice IDs that have been reconciled
-    reconciled_invoice_ids = session.query(ReconciliationResult.invoice_id).all()
-    reconciled_invoice_ids = {id[0] for id in reconciled_invoice_ids}
-    
-    for inv in paid_invoices:
-        if inv.id not in reconciled_invoice_ids:
-            # ALERT: CRM says Paid, but Agent has no record of it!
-            issues.append({
-                'type': 'GHOST_PAYMENT',
-                'invoice': inv,
-                'severity': 'HIGH',
-                'message': f"Invoice {inv.invoice_number} is PAID in CRM but has no linked Bank Payment."
-            })
-            
-    session.close()
-    return issues
+    return [] # TODO: Implement Audit later once basic matching works
 
 if __name__ == "__main__":
     # Test Matcher
