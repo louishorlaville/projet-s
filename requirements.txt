@@ -1,3 +1,5 @@
 sqlalchemy
 pandas
 streamlit
+requests
+google-generativeai

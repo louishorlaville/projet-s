@@ -14,6 +14,20 @@ class DolibarrClient:
             "Accept": "application/json"
         }
 
+    def _post(self, endpoint, data=None):
+        url = f"{self.base_url}{endpoint}"
+        try:
+            response = requests.post(url, headers=self.headers, json=data)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.HTTPError as e:
+            print(f"HTTP Error: {e}")
+            print(f"Response: {response.text}")
+            return None
+        except Exception as e:
+            print(f"Error connecting to Dolibarr: {e}")
+            return None
+
     def _get(self, endpoint, params=None):
         url = f"{self.base_url}{endpoint}"
         try:
@@ -32,19 +46,21 @@ class DolibarrClient:
         """Fetch all third parties (clients/prospects)"""
         return self._get("/thirdparties")
 
+    def get_all_invoices(self):
+        """Fetch all validated invoices (Paid or Unpaid)"""
+        # Status 1 = Validated (Open or Paid). 2 = Paid (in some versions, or paye field)
+        # We fetch all with sortorder DESC to see recent ones
+        invoices = self._get("/invoices", params={"sortfield": "t.datec", "sortorder": "DESC", "limit": 100})
+        
+        # Filter for Validated (status >= 1) just in case
+        validated = [inv for inv in invoices if inv.get('status') in ['1', '2']]
+        return validated
+
     def get_unpaid_invoices(self):
-        """Fetch invoices with status=unpaid (status property might vary, usually 'statut' or 'paye')"""
-        # Status "0" = Draft, "1" = Unpaid, "2" = Paid, "3" = Abandoned
-        # We want validated (1) and unpaid (paye=0)
-        # Dolibarr filtering syntax is SQL-like in some versions, or query params
-        # Simple param: sqlfilters=(t.paye:=:0)
-        
-        # Determine correct filter based on API version. 
-        # For now, fetch all and filter in python if API filter is tricky
-        invoices = self._get("/invoices", params={"sortfield": "t.rowid", "sortorder": "ASC", "limit": 100})
-        
-        # Filter for Unpaid: paye == 0 AND status == 1 (Validated)
-        unpaid = [inv for inv in invoices if inv.get('status') == '1' and inv.get('paye') == '0']
+        """Fetch invoices with status=unpaid"""
+        invoices = self.get_all_invoices()
+        # Filter for Unpaid: paye == 0
+        unpaid = [inv for inv in invoices if inv.get('paye') == '0']
         return unpaid
 
     def get_bank_accounts(self):
