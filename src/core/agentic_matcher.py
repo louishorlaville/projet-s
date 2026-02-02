@@ -1,95 +1,107 @@
 import json
 import logging
+import os
 from datetime import datetime
-from src.core.llm_client import LLMClient
+from src.config import LLM_API_KEY, LLM_MODEL
+
+# LangChain Imports
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import JsonOutputParser
 
 class AgenticMatcher:
     def __init__(self):
-        self.llm = LLMClient()
+        # Initialize Google GenAI via LangChain
+        if not LLM_API_KEY:
+            raise ValueError("LLM_API_KEY is not set in config.")
+        
+        self.llm = ChatGoogleGenerativeAI(
+            model=LLM_MODEL,
+            google_api_key=LLM_API_KEY,
+            temperature=0.0
+        )
+        
+        # Define output parser
+        self.parser = JsonOutputParser()
 
     def smart_reconcile(self, invoices, payments):
         """
-        Identify matches using LLM reasoning.
+        Identify matches using LLM reasoning via LangChain.
         """
-        # 1. Pre-filtering: Only consider items that are not obviously mismatched by huge date diffs 
-        # (Though for a small prototype, we can send all open items).
-        
         if not invoices or not payments:
             return []
 
-        # Prepare Data for Prompt
-        invoices_str = json.dumps([{
+        # Prepare Data
+        # Filter fields to reduce token usage
+        clean_invoices = [{
             "id": inv['id'],
-            "ref": inv['ref'], 
-            "amount": float(inv['total_ttc']),
-            "date": inv['date'], # Timestamp
-            "customer_id": inv['socid']
-        } for inv in invoices])
+            "ref": inv.get('ref'), 
+            "amount": float(inv.get('total_ttc', 0)),
+            "date": inv.get('date'), 
+            "customer": inv.get('Customer', inv.get('socid'))
+        } for inv in invoices]
 
-        payments_str = json.dumps([{
+        clean_payments = [{
             "id": pay['id'],
-            "label": pay['label'],
-            "amount": float(pay['amount']),
-            "date": pay['datev'] # Timestamp
-        } for pay in payments])
+            "label": pay.get('label'),
+            "amount": float(pay.get('amount', 0)),
+            "date": pay.get('datev') 
+        } for pay in payments]
 
-        # System Prompt
-        system_prompt = """
-        You are an expert financial auditor and reconciliation agent.
+        # Template
+        template = """
+        You are an expert financial reconciliation agent.
         Your goal is to match Invoices to Bank Payments.
+
+        RULES:
+        1. Match by AMOUNT (Exact or Partial).
+        2. Match by ENTITY NAME (Fuzzy matching allowed).
+        3. Match by DATE (Payment date is usually close to invoice date).
+        4. PARTIAL PAYMENTS: Valid if Payment < Invoice.
+        5. SUM LOGIC: One payment can cover multiple invoices.
+
+        CONFIDENCE SCORING:
+        - 0.95 - 1.00: Exact Match (Amount + Name + Date)
+        - 0.85 - 0.94: Partial Payment or Minor Date/Name Diff
+        - 0.70 - 0.84: Likely Match (Major Date Diff or Name Diff)
+
+        INPUT DATA:
+        Invoices: {invoices}
         
-        Rules:
-        1. Match based on Amount (exact or partial payments are acceptable).
-        2. Match based on Entity Name (e.g. 'Photo Saint-Denis' similar to 'Payment from Photo St-Denis').
-        3. Match based on Date (Payment usually shortly after Invoice).
-        4. **Partial Payments**: If a payment amount is less than the invoice total, it's still a valid match (note this in the reason).
-        5. One Payment can cover multiple Invoices (Sum logic).
-        6. Set confidence score based on match quality:
-           - 0.95-1.0 for exact matches
-           - 0.80-0.94 for partial payments or fuzzy name matches
-           - 0.60-0.79 for date mismatches but amount matches
-        7. Return ONLY a JSON list of matches.
-        
-        Output Format:
+        Payments: {payments}
+
+        OUTPUT FORMAT:
+        Return ONLY a JSON list (no markdown).
         [
-            {
-                "invoice_id": 123,
-                "payment_id": 456,
+            {{
+                "invoice_id": "ID",
+                "payment_id": "ID",
                 "confidence": 0.95,
-                "reason": "Exact amount match and name similarity."
-            }
+                "reason": "Explanation"
+            }}
         ]
-        If no matches found, return empty list [].
-        Do not return markdown formatting, just raw JSON.
+        If no matches, return [].
         """
 
-        user_prompt = f"""
-        Here are the Unpaid Invoices:
-        {invoices_str}
+        prompt = PromptTemplate(
+            template=template,
+            input_variables=["invoices", "payments"]
+        )
 
-        Here are the Unreconciled Payments:
-        {payments_str}
+        # Create Chain
+        chain = prompt | self.llm | self.parser
 
-        Find the matches.
-        """
-
-        print("🤖 Asking LLM to match...")
-        response_text = self.llm.get_completion(system_prompt, user_prompt)
+        print("🔗 LangChain Agent reconciling...")
         
-        if not response_text:
-            return []
-
-        # Parse JSON
         try:
-            # Clean md code blocks if present
-            cleaned_text = response_text.replace("```json", "").replace("```", "").strip()
-            matches = json.loads(cleaned_text)
+            matches = chain.invoke({
+                "invoices": json.dumps(clean_invoices),
+                "payments": json.dumps(clean_payments)
+            })
             return matches
-        except json.JSONDecodeError as e:
-            print(f"Error parsing LLM JSON: {e}")
-            print(f"Raw Response: {response_text}")
+        except Exception as e:
+            print(f"❌ LangChain Error: {e}")
             return []
 
 if __name__ == "__main__":
-    # Test Stub
     pass
